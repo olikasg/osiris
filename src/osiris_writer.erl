@@ -4,9 +4,10 @@
 
 -export([start_link/1,
          start/1,
-         init_reader/2,
+         init_data_reader/2,
+         init_offset_reader/2,
          register_data_listener/2,
-         register_offset_listener/1,
+         register_offset_listener/2,
          unregister_offset_listener/1,
          ack/2,
          write/4,
@@ -33,12 +34,12 @@
              }).
 
 -record(?MODULE, {cfg :: #cfg{},
-                  segment = osiris_segment:state(),
-                  pending_writes = #{} :: #{osiris_segment:offset() =>
+                  log = osiris_log:state(),
+                  pending_writes = #{} :: #{osiris:offset() =>
                                             {[node()], #{pid() => [term()]}}},
-                  data_listeners = [] :: [{pid(), osiris_segment:offset()}],
-                  offset_listeners = [] :: [pid()],
-                  committed_offset = -1 :: osiris_segment:offset()
+                  data_listeners = [] :: [{pid(), osiris:offset()}],
+                  offset_listeners = [] :: [{pid(), osiris:offset()}],
+                  committed_offset = -1 :: osiris:offset()
                  }).
 
 -opaque state() :: #?MODULE{}.
@@ -62,22 +63,30 @@ stop(#{name := Name,
 
 delete(#{leader_node := Leader} = Config) ->
     stop(Config),
-    rpc:call(Leader, osiris_segment, delete_directory, [Config]).
+    rpc:call(Leader, osiris_log, delete_directory, [Config]).
 
 -spec start_link(Config :: map()) ->
     {ok, pid()} | {error, {already_started, pid()}}.
 start_link(Config) ->
     gen_batch_server:start_link(?MODULE, Config).
 
-init_reader(Pid, StartOffset) when node(Pid) == node() ->
+% -spec init_data_reader(pid(), osiris:tail_info()) ->
+%     {ok, osiris_log:state()} | {error, .
+init_data_reader(Pid, TailInfo) when node(Pid) == node() ->
     Ctx = gen_batch_server:call(Pid, get_reader_context),
-    osiris_segment:init_reader(StartOffset, Ctx).
+    osiris_log:init_data_reader(TailInfo, Ctx).
+
+% -spec init_offset_reader(pid(), osiris:offset()) ->
+%     osiris_log:state().
+init_offset_reader(Pid, OffsetSpec) when node(Pid) == node() ->
+    Ctx = gen_batch_server:call(Pid, get_reader_context),
+    osiris_log:init_offset_reader(OffsetSpec, Ctx).
 
 register_data_listener(Pid, Offset) ->
     ok = gen_batch_server:cast(Pid, {register_data_listener, self(), Offset}).
 
-register_offset_listener(Pid) ->
-    ok = gen_batch_server:cast(Pid, {register_offset_listener, self()}).
+register_offset_listener(Pid, Offset) ->
+    ok = gen_batch_server:cast(Pid, {register_offset_listener, self(), Offset}).
 
 unregister_offset_listener(Pid) ->
   ok = gen_batch_server:cast(Pid, {unregister_offset_listener, self()}).
@@ -101,13 +110,13 @@ init(#{name := Name,
        external_ref := ExtRef,
        replica_nodes := Replicas} = Config)
   when is_list(Name) ->
-    Dir = osiris_segment:directory(Config),
+    Dir = osiris_log:directory(Config),
     process_flag(trap_exit, true),
     process_flag(message_queue_data, off_heap),
-    ORef = atomics:new(1, []),
-    Segment = osiris_segment:init(Dir, Config),
+    ORef = atomics:new(1, [{signed, true}]),
+    Log = osiris_log:init(Dir, Config),
     CntRef = osiris_counters:new({?MODULE, ExtRef}, ?COUNTER_FIELDS),
-    LastOffs = osiris_segment:next_offset(Segment) -1,
+    LastOffs = osiris_log:next_offset(Log) -1,
     atomics:put(ORef, 1, LastOffs),
     counters:put(CntRef, ?C_OFFSET, LastOffs),
     counters:put(CntRef, ?C_COMMITTED_OFFSET, LastOffs),
@@ -123,10 +132,10 @@ init(#{name := Name,
                              counter = CntRef},
 
                   committed_offset = LastOffs,
-                  segment = Segment}}.
+                  log = Log}}.
 
 handle_batch(Commands, #?MODULE{cfg = #cfg{counter = Cnt},
-                                segment = Seg0} = State0) ->
+                                log = Seg0} = State0) ->
 
     %% filter write commands
     case handle_commands(Commands, State0, {[], [], #{}}) of
@@ -137,14 +146,14 @@ handle_batch(Commands, #?MODULE{cfg = #cfg{counter = Cnt},
                          [] ->
                              State1;
                          _ ->
-                             ThisBatchOffs = osiris_segment:next_offset(Seg0),
-                             Seg = osiris_segment:write(Entries, Seg0),
-                             LastOffs = osiris_segment:next_offset(Seg) - 1,
+                             ThisBatchOffs = osiris_log:next_offset(Seg0),
+                             Seg = osiris_log:write(Entries, Seg0),
+                             LastOffs = osiris_log:next_offset(Seg) - 1,
                              %% update written
                              counters:add(Cnt, ?C_CHUNKS_WRITTEN, 1),
                              counters:put(Cnt, ?C_OFFSET, LastOffs),
                              update_pending(ThisBatchOffs, Corrs,
-                                            State1#?MODULE{segment = Seg})
+                                            State1#?MODULE{log = Seg})
                      end,
             %% write to log and index files
             State = notify_data_listeners(State2),
@@ -173,8 +182,7 @@ update_pending(BatchOffs, Corrs,
     atomics:put(OffsRef, 1, BatchOffs),
     counters:put(Cnt, ?C_COMMITTED_OFFSET, BatchOffs),
     State = State0#?MODULE{committed_offset = BatchOffs},
-    ok = notify_offset_listeners(State),
-    State;
+    notify_offset_listeners(State);
 update_pending(BatchOffs, Corrs,
                #?MODULE{cfg = #cfg{replicas = Replicas},
                         pending_writes = Pending0} = State) ->
@@ -197,11 +205,10 @@ handle_commands([{cast, {register_data_listener, Pid, Offset}} | Rem],
                 #?MODULE{data_listeners = Listeners} = State0, Acc) ->
     State = State0#?MODULE{data_listeners = [{Pid, Offset} | Listeners]},
     handle_commands(Rem, State, Acc);
-handle_commands([{cast, {register_offset_listener, Pid}} | Rem],
+handle_commands([{cast, {register_offset_listener, Pid, Offset}} | Rem],
                 #?MODULE{offset_listeners = Listeners} = State0, Acc) ->
-    State = State0#?MODULE{offset_listeners = [Pid | Listeners]},
-    %% TODO: only notify the newly registered offset listener
-    notify_offset_listeners(State),
+    State1 = State0#?MODULE{offset_listeners = [{Pid, Offset} | Listeners]},
+    State = notify_offset_listeners(State1),
     handle_commands(Rem, State, Acc);
 handle_commands([{cast, {unregister_offset_listener, Pid}} | Rem],
     #?MODULE{offset_listeners = Listeners} = State0, Acc) ->
@@ -231,16 +238,15 @@ handle_commands([{cast, {ack, ReplicaNode, Offsets}} | Rem],
                 end, {COffs0, Pending0}, Offsets),
     % ct:pal("acks after ~w ~W", [COffs, Pending, 5]),
     counters:put(Cnt, ?C_COMMITTED_OFFSET, COffs),
-    State = State0#?MODULE{pending_writes = Pending,
+    State1 = State0#?MODULE{pending_writes = Pending,
                            committed_offset = COffs},
     %% if committed offset has incresed - update 
-    case COffs > COffs0 of
-        true ->
-            ok = notify_offset_listeners(State);
-        false ->
-            ok
-    end,
-
+    State = case COffs > COffs0 of
+                true ->
+                    notify_offset_listeners(State1);
+                false ->
+                    State1
+            end,
     handle_commands(Rem, State, Acc);
 handle_commands([{call, From, get_reader_context} | Rem],
                 #?MODULE{cfg = #cfg{offset_ref = ORef,
@@ -258,9 +264,9 @@ handle_commands([_Unk | Rem], State, Acc) ->
     handle_commands(Rem, State, Acc).
 
 
-notify_data_listeners(#?MODULE{segment = Seg,
+notify_data_listeners(#?MODULE{log = Seg,
                                data_listeners = L0} = State) ->
-    LastOffset = osiris_segment:next_offset(Seg) - 1,
+    LastOffset = osiris_log:next_offset(Seg) - 1,
     {Notify, L} = lists:splitwith(fun ({_Pid, O}) -> O < LastOffset end, L0),
     [gen_server:cast(P, {more_data, LastOffset})
      || {P, _} <- Notify],
@@ -268,15 +274,23 @@ notify_data_listeners(#?MODULE{segment = Seg,
 
 notify_offset_listeners(#?MODULE{cfg = #cfg{ext_reference = Ref},
                                  committed_offset = COffs,
-                                 % segment = Seg,
-                                 offset_listeners = L0}) ->
-    [begin
-         % Next = osiris_segment:next_offset(Seg),
-         % error_logger:info_msg("osiris_writer offset listener ~w CO: ~w Next ~w LO: ~w",
-         %                       [P, COffs, Next, O]),
-         P ! {osiris_offset, Ref, COffs}
-     end || P <- L0],
-    ok.
+                                 offset_listeners = L0} = State) ->
+    {Notify, L} = lists:splitwith(fun ({_Pid, O}) -> O =< COffs end, L0),
+    [P ! {osiris_offset, Ref, COffs}
+     || {P, _} <- Notify],
+    State#?MODULE{offset_listeners = L}.
+
+% notify_offset_listeners(#?MODULE{cfg = #cfg{ext_reference = Ref},
+%                                  committed_offset = COffs,
+%                                  % log = Seg,
+%                                  offset_listeners = L0}) ->
+%     [begin
+%          % Next = osiris_log:next_offset(Seg),
+%          % error_logger:info_msg("osiris_writer offset listener ~w CO: ~w Next ~w LO: ~w",
+%          %                       [P, COffs, Next, O]),
+%          P ! {osiris_offset, Ref, COffs}
+%      end || P <- L0],
+%     ok.
 
 notify_writers(Name, Corrs) ->
     maps:map(
