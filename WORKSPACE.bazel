@@ -17,7 +17,7 @@ load("@bazel-erlang//:hex_pm.bzl", "hex_pm_bazel_erlang_lib")
 hex_pm_bazel_erlang_lib(
     name = "gen_batch_server",
     sha256 = "b78679349168f27d7047f3283c9d766760b234d98c762aca9a1907f4ee3fd406",
-    version = "0.8.6",
+    version = "0.8.7",
 )
 
 github_bazel_erlang_lib(
