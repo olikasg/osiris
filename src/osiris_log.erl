@@ -939,12 +939,6 @@ init_data_reader({StartChunkId, PrevEOT}, #{dir := Dir,
            [Name, StartChunkId, PrevEOT, Range]),
     %% Invariant:  there is always at least one segment left on disk
     case Range of
-        {FstOffs, LastOffs}
-          when StartChunkId < FstOffs
-               orelse StartChunkId > LastOffs + 1 ->
-            {error, {offset_out_of_range, Range}};
-        empty when StartChunkId > 0 ->
-            {error, {offset_out_of_range, Range}};
         _ when PrevEOT == empty ->
             %% this assumes the offset is in range
             %% first we need to validate PrevEO
@@ -952,6 +946,12 @@ init_data_reader({StartChunkId, PrevEOT}, #{dir := Dir,
                    StartChunkId,
                    find_segment_for_offset(StartChunkId, IdxFiles),
                    Config)};
+        {FstOffs, LastOffs}
+          when StartChunkId < FstOffs
+               orelse StartChunkId > LastOffs + 1 ->
+            {error, {offset_out_of_range, Range}};
+        empty when StartChunkId > 0 ->
+            {error, {offset_out_of_range, Range}};
         _ ->
             {PrevEpoch, PrevChunkId, _PrevTs} = PrevEOT,
             case check_chunk_has_expected_epoch(PrevChunkId, PrevEpoch, IdxFiles) of
@@ -1013,6 +1013,12 @@ init_data_reader_from(ChunkId,
                       Config) ->
     {ChunkId, AttachPos} = next_location(LastChunk),
     init_data_reader_at(ChunkId, AttachPos, File, Config);
+init_data_reader_from(_OldChunkId,
+                      {beginning_of_log, #seg_info{file = File,
+                                                   first = FirstChunk}},
+                      Config) ->
+    {NewChunkId, AttachPos} = next_location(FirstChunk),
+    init_data_reader_at(NewChunkId, AttachPos, File, Config);
 init_data_reader_from(ChunkId,
                       {found, #seg_info{file = File} = SegInfo},
                       Config) ->
@@ -2317,7 +2323,16 @@ find_segment_for_offset(Offset, IdxFiles) ->
                     Err
             end;
         false ->
-            not_found
+	    %% Assuming that the offset is lower than the first (oldest)
+	    %% chunk. It can happen when a new member joins the cluster with 
+	    %% empty state.
+            [FirstIdxFile | _] = IdxFiles,
+            case build_seg_info(FirstIdxFile) of
+                {ok, #seg_info{} = Info} ->
+                    {beginning_of_log, Info};
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 can_read_next_chunk_id(#?MODULE{mode = #read{type = offset,
